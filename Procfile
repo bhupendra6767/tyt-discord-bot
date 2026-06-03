@@ -1,1 +1,1 @@
-worker: python3 tyt-bot/bot.py
+web: python3 tyt-bot/bot.py
