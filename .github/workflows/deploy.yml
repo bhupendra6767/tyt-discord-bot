@@ -1,0 +1,14 @@
+name: Deploy TYT Bot
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Deploy to Render
+        run: echo "Render auto-deploys from GitHub. Push to main to trigger."
