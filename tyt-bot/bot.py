@@ -2130,4 +2130,5 @@ if __name__ == "__main__":
         logger.error("DISCORD_TOKEN environment variable is not set!")
         exit(1)
 
+    token = token.strip()
     bot.run(token, log_handler=None)
