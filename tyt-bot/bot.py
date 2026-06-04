@@ -38,21 +38,57 @@ def run_flask():
 # ─────────────────────────────────────────────
 DB_PATH = "tyt_bot.db"
 
-TIERS = ["HT1", "HT2", "HT3", "HT4", "HT5", "LT1", "LT2", "LT3", "LT4", "LT5", "Unranked"]
+TIERS = ["HT1", "HT2", "HT3", "HT4", "HT5", "MT1", "MT2", "MT3", "MT4", "MT5", "LT1", "LT2", "LT3", "LT4", "LT5", "Unranked"]
 
-GAMEMODES = ["UHC", "Pot", "Sword", "Axe", "SMP", "Vanilla", "NethOP", "Mace", "Cart", "DiaSMP"]
+GAMEMODES = ["UHC", "Sword", "Axe", "NethPot", "DiaPot", "SMP", "Mace", "CPvP"]
 
 GAMEMODE_EMOJIS = {
     "UHC": "🌟",
-    "Pot": "🧪",
     "Sword": "⚔️",
     "Axe": "🪓",
+    "NethPot": "💀",
+    "DiaPot": "💎",
     "SMP": "🌿",
-    "Vanilla": "🔮",
-    "NethOP": "💀",
     "Mace": "🔨",
-    "Cart": "🛒",
-    "DiaSMP": "💎",
+    "CPvP": "🔮",
+}
+
+# Exact Discord role names from server — used for name-based lookup
+WAITLIST_ROLE_MAP = {
+    "UHC":     "Waitlist [UHC]",
+    "Sword":   "Waitlist [Sword]",
+    "Axe":     "Waitlist [Axe & Shield]",
+    "NethPot": "Waitlist [Neth Pot]",
+    "DiaPot":  "Waitlist [Dia Pot]",
+    "SMP":     "Waitlist [SMP Kit]",
+    "Mace":    "Waitlist [Mace]",
+    "CPvP":    "Waitlist [CPvP]",
+}
+
+QUEUE_ROLE_MAP = {
+    "UHC":     "UHC Queue",
+    "Sword":   "Sword Queue",
+    "Axe":     "Axe Queue",
+    "NethPot": "NetheritePot Queue",
+    "DiaPot":  "DiamondPot Queue",
+    "SMP":     "SMP Queue",
+    "Mace":    "Mace Queue",
+    "CPvP":    "Crystal Queue",
+}
+
+# All staff role names — checked by name so no /setup roles needed
+STAFF_ROLE_NAMES = {
+    "Ownership", "Founder", "Manager", "Staff Manager", "Media Manager",
+    "Admin", "Sr.Mod", "Moderator", "Helper", "Trial Staff",
+    "TYT Staff", "TYT Admin",
+}
+
+TICKET_PERM_ROLE_NAMES = {"[/] Ticket Perm", "TYT Admin", "Ownership", "Founder", "Manager", "Admin"}
+
+TESTER_ROLE_NAMES = {
+    "TYT High Tester", "TYT Tester", "Mace Tester", "Crystal Tester",
+    "UHC Tester", "Diapot Tester", "Nethpot Tester", "SMP Tester",
+    "Sword Tester", "Axe Tester", "Tier Testers",
 }
 
 REGIONS = ["NA", "EU", "AS/AU", "SA"]
@@ -158,7 +194,8 @@ async def init_db():
                 status TEXT DEFAULT 'open',
                 created_at TEXT NOT NULL,
                 closed_at TEXT,
-                transcript TEXT
+                transcript TEXT,
+                claimed_by INTEGER
             )
         """)
         await db.execute("""
@@ -224,6 +261,12 @@ async def init_db():
             )
         """)
         await db.commit()
+        # ── Schema migrations for existing databases ─────────────
+        try:
+            await db.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
+            await db.commit()
+        except Exception:
+            pass  # Column already exists — safe to ignore
     logger.info("Database initialized.")
 
 
@@ -264,20 +307,35 @@ async def set_guild_config(guild_id: int, config: dict):
 def has_staff_role(member: discord.Member, staff_role_id: int = None) -> bool:
     if member.guild_permissions.administrator:
         return True
+    member_role_names = {r.name for r in member.roles}
+    if STAFF_ROLE_NAMES & member_role_names:
+        return True
     if staff_role_id:
         return any(r.id == staff_role_id for r in member.roles)
     return False
 
 
+def has_ticket_perm(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    return bool(TICKET_PERM_ROLE_NAMES & {r.name for r in member.roles})
+
+
+def has_tester_role(member: discord.Member) -> bool:
+    if member.guild_permissions.administrator:
+        return True
+    member_role_names = {r.name for r in member.roles}
+    return bool((TESTER_ROLE_NAMES | STAFF_ROLE_NAMES) & member_role_names)
+
+
 async def is_tester_or_staff(member: discord.Member, guild_id: int) -> bool:
-    cfg = await get_guild_config(guild_id)
-    tester_role_id = cfg.get("tester_role")
-    staff_role_id = cfg.get("staff_role")
-    if has_staff_role(member, staff_role_id):
+    if member.guild_permissions.administrator:
         return True
-    if tester_role_id and any(r.id == tester_role_id for r in member.roles):
-        return True
-    return False
+    return has_tester_role(member)
+
+
+def get_role_by_name(guild: discord.Guild, name: str) -> discord.Role | None:
+    return discord.utils.get(guild.roles, name=name)
 
 # ─────────────────────────────────────────────
 # BOT SETUP
@@ -408,89 +466,120 @@ class WaitlistPanel(discord.ui.View):
     async def uhc_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_waitlist_join(interaction, "UHC")
 
-    @discord.ui.button(label="Pot", style=discord.ButtonStyle.secondary, emoji="🧪", custom_id="wl_pot", row=0)
-    async def pot_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "Pot")
-
-    @discord.ui.button(label="Mace", style=discord.ButtonStyle.secondary, emoji="🔨", custom_id="wl_mace", row=1)
-    async def mace_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "Mace")
-
-    @discord.ui.button(label="NethOP", style=discord.ButtonStyle.secondary, emoji="💀", custom_id="wl_nethop", row=1)
-    async def nethop_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "NethOP")
-
-    @discord.ui.button(label="SMP", style=discord.ButtonStyle.secondary, emoji="🌿", custom_id="wl_smp", row=2)
-    async def smp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "SMP")
-
-    @discord.ui.button(label="Sword", style=discord.ButtonStyle.secondary, emoji="⚔️", custom_id="wl_sword", row=2)
+    @discord.ui.button(label="Sword", style=discord.ButtonStyle.secondary, emoji="⚔️", custom_id="wl_sword", row=0)
     async def sword_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_waitlist_join(interaction, "Sword")
 
-    @discord.ui.button(label="Axe", style=discord.ButtonStyle.secondary, emoji="🪓", custom_id="wl_axe", row=2)
+    @discord.ui.button(label="Axe", style=discord.ButtonStyle.secondary, emoji="🪓", custom_id="wl_axe", row=0)
     async def axe_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         await handle_waitlist_join(interaction, "Axe")
 
-    @discord.ui.button(label="Vanilla", style=discord.ButtonStyle.secondary, emoji="🔮", custom_id="wl_vanilla", row=3)
-    async def vanilla_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "Vanilla")
+    @discord.ui.button(label="Neth Pot", style=discord.ButtonStyle.secondary, emoji="💀", custom_id="wl_nethpot", row=1)
+    async def nethpot_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_waitlist_join(interaction, "NethPot")
 
-    @discord.ui.button(label="Cart", style=discord.ButtonStyle.secondary, emoji="🛒", custom_id="wl_cart", row=3)
-    async def cart_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "Cart")
+    @discord.ui.button(label="Dia Pot", style=discord.ButtonStyle.secondary, emoji="💎", custom_id="wl_diapot", row=1)
+    async def diapot_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_waitlist_join(interaction, "DiaPot")
 
-    @discord.ui.button(label="DiaSmp", style=discord.ButtonStyle.secondary, emoji="💎", custom_id="wl_diasmp", row=3)
-    async def diasmp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await handle_waitlist_join(interaction, "DiaSMP")
+    @discord.ui.button(label="SMP", style=discord.ButtonStyle.secondary, emoji="🌿", custom_id="wl_smp", row=1)
+    async def smp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_waitlist_join(interaction, "SMP")
+
+    @discord.ui.button(label="Mace", style=discord.ButtonStyle.secondary, emoji="🔨", custom_id="wl_mace", row=2)
+    async def mace_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_waitlist_join(interaction, "Mace")
+
+    @discord.ui.button(label="CPvP", style=discord.ButtonStyle.secondary, emoji="🔮", custom_id="wl_cpvp", row=2)
+    async def cpvp_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_waitlist_join(interaction, "CPvP")
 
 
 async def handle_waitlist_join(interaction: discord.Interaction, gamemode: str):
+    """Assign waitlist + queue roles by exact name lookup and confirm to user."""
+    await interaction.response.defer(ephemeral=True)
+
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT * FROM users WHERE user_id = ?", (interaction.user.id,)) as cur:
             user = await cur.fetchone()
 
     if not user:
-        await interaction.response.send_message(
-            "❌ You must register your profile first! Click the **'Register / Update Profile'** button.",
+        await interaction.followup.send(
+            "❌ You must register your profile first! Click the **Register/Update** button above.",
             ephemeral=True
         )
         return
 
     mc_username, region, account_type = user[1], user[2], user[3]
-    cfg = await get_guild_config(interaction.guild.id)
-    role_id = cfg.get(f"waitlist_role_{gamemode.lower()}")
+    emoji = GAMEMODE_EMOJIS.get(gamemode, "⚔️")
+    guild = interaction.guild
+    member = interaction.user
+    roles_added = []
+    warnings = []
 
-    if role_id:
-        role = interaction.guild.get_role(role_id)
-        if role:
-            if role in interaction.user.roles:
-                await interaction.response.send_message(
-                    f"⚠️ You are already on the **{gamemode}** waitlist!", ephemeral=True
-                )
-                return
+    # ── Waitlist role ──────────────────────────────────────────
+    wl_role_name = WAITLIST_ROLE_MAP.get(gamemode)
+    if wl_role_name:
+        wl_role = get_role_by_name(guild, wl_role_name)
+        if wl_role is None:
+            warnings.append(f"⚠️ Waitlist role `{wl_role_name}` not found in server.")
+        elif wl_role in member.roles:
+            await interaction.followup.send(
+                f"⚠️ You already have the **{wl_role_name}** role — you're already on the {gamemode} waitlist!",
+                ephemeral=True
+            )
+            return
+        else:
             try:
-                await interaction.user.add_roles(role, reason=f"Joined {gamemode} waitlist")
+                await member.add_roles(wl_role, reason=f"Joined {gamemode} waitlist via panel")
+                roles_added.append(wl_role_name)
             except discord.Forbidden:
+                warnings.append(f"⚠️ Missing permissions to assign `{wl_role_name}`.")
+            except discord.HTTPException as e:
+                warnings.append(f"⚠️ Could not assign waitlist role: {e}")
+
+    # ── Queue role (ping role for when queue opens) ────────────
+    q_role_name = QUEUE_ROLE_MAP.get(gamemode)
+    if q_role_name:
+        q_role = get_role_by_name(guild, q_role_name)
+        if q_role and q_role not in member.roles:
+            try:
+                await member.add_roles(q_role, reason=f"Queue ping role for {gamemode}")
+                roles_added.append(q_role_name)
+            except (discord.Forbidden, discord.HTTPException):
+                pass  # Queue ping role is optional — don't block the flow
+
+    # ── Also respect /setup-configured role ID as fallback ─────
+    cfg = await get_guild_config(guild.id)
+    cfg_role_id = cfg.get(f"waitlist_role_{gamemode.lower()}")
+    if cfg_role_id and not wl_role_name:
+        cfg_role = guild.get_role(cfg_role_id)
+        if cfg_role and cfg_role not in member.roles:
+            try:
+                await member.add_roles(cfg_role, reason=f"Joined {gamemode} waitlist (cfg)")
+                roles_added.append(cfg_role.name)
+            except (discord.Forbidden, discord.HTTPException):
                 pass
 
-    await log_event("WAITLIST_JOIN", interaction.user.id, gamemode, details=f"Region:{region}")
+    await log_event("WAITLIST_JOIN", member.id, gamemode, details=f"Region:{region} Roles:{roles_added}")
 
-    emoji = GAMEMODE_EMOJIS.get(gamemode, "⚔️")
     embed = discord.Embed(
-        title="✅ Waitlist Role Added!",
-        description=f"You have been given the **{gamemode}** waitlist role",
+        title="✅ Waitlist Joined!",
+        description=f"You have been added to the **{emoji} {gamemode}** waitlist.",
         color=COLORS["green"]
     )
     embed.set_thumbnail(url=skin_url(mc_username))
-    if role_id:
-        embed.add_field(name="Next Step", value=f"Go to the **{gamemode.lower()}-waitlist** channel and wait for a tester to open queue", inline=False)
+    if roles_added:
+        embed.add_field(name="🏷️ Roles Assigned", value="\n".join(f"• `{r}`" for r in roles_added), inline=False)
+    embed.add_field(name="📋 Next Step", value="Go to the waitlist channel and wait for a tester to open the queue.", inline=False)
     embed.add_field(name="👤 Username", value=mc_username, inline=True)
     embed.add_field(name=f"{emoji} Gamemode", value=gamemode, inline=True)
     embed.add_field(name="🌐 Region", value=region, inline=True)
     embed.add_field(name="💎 Account Type", value=account_type, inline=True)
+    if warnings:
+        embed.add_field(name="⚠️ Notes", value="\n".join(warnings), inline=False)
     embed.set_footer(text="TestYourTier | TYT")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 # ─────────────────────────────────────────────
 # VIEWS – QUEUE  (persistent — per-gamemode static custom_ids)
@@ -2071,6 +2160,260 @@ async def setup_everything(interaction: discord.Interaction):
 
 
 tree.add_command(setup_group)
+
+# ─────────────────────────────────────────────
+# SLASH COMMANDS – TICKET MANAGEMENT
+# /add /remove /requestclose /close /claim /panel
+# ─────────────────────────────────────────────
+
+def _ticket_check(interaction: discord.Interaction) -> bool:
+    """True if caller has staff/ticket-perm or is the ticket owner."""
+    return has_ticket_perm(interaction.user)
+
+
+async def _get_ticket_by_channel(channel_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT * FROM tickets WHERE channel_id = ?", (channel_id,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+@tree.command(name="add", description="Add a user to the current ticket channel")
+@app_commands.describe(user="The user to add to this ticket")
+async def ticket_add_cmd(interaction: discord.Interaction, user: discord.Member):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    if not _ticket_check(interaction):
+        await interaction.response.send_message("❌ You don't have permission to manage this ticket.", ephemeral=True)
+        return
+    try:
+        await interaction.channel.set_permissions(
+            user,
+            read_messages=True,
+            send_messages=True,
+            reason=f"Added to ticket by {interaction.user}"
+        )
+        embed = discord.Embed(
+            description=f"✅ {user.mention} has been **added** to this ticket by {interaction.user.mention}.",
+            color=COLORS["green"]
+        )
+        embed.set_footer(text="TestYourTier | TYT")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don't have permission to edit this channel.", ephemeral=True)
+
+
+@tree.command(name="remove", description="Remove a user from the current ticket channel")
+@app_commands.describe(user="The user to remove from this ticket")
+async def ticket_remove_cmd(interaction: discord.Interaction, user: discord.Member):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    if not _ticket_check(interaction):
+        await interaction.response.send_message("❌ You don't have permission to manage this ticket.", ephemeral=True)
+        return
+    if user.id == ticket[1]:  # ticket owner
+        await interaction.response.send_message("❌ You cannot remove the ticket owner.", ephemeral=True)
+        return
+    try:
+        await interaction.channel.set_permissions(
+            user,
+            overwrite=None,
+            reason=f"Removed from ticket by {interaction.user}"
+        )
+        embed = discord.Embed(
+            description=f"🚫 {user.mention} has been **removed** from this ticket by {interaction.user.mention}.",
+            color=COLORS["red"]
+        )
+        embed.set_footer(text="TestYourTier | TYT")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ I don't have permission to edit this channel.", ephemeral=True)
+
+
+@tree.command(name="requestclose", description="Request that this ticket be closed")
+@app_commands.describe(reason="Reason for requesting closure")
+async def ticket_requestclose_cmd(interaction: discord.Interaction, reason: str = "No reason provided"):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔒 Close Request",
+        description=f"{interaction.user.mention} has requested this ticket be closed.\n\n**Reason:** {reason}",
+        color=COLORS["orange"]
+    )
+    embed.set_footer(text="TestYourTier | TYT • Staff can close with /close")
+
+    class ConfirmCloseView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=300)
+
+        @discord.ui.button(label="Close Now", style=discord.ButtonStyle.danger, emoji="🔒")
+        async def confirm_close(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            if not has_ticket_perm(btn_interaction.user):
+                await btn_interaction.response.send_message("❌ Staff only.", ephemeral=True)
+                return
+            await btn_interaction.response.send_message("🔒 Closing ticket...", ephemeral=True)
+            await asyncio.sleep(3)
+            try:
+                await btn_interaction.channel.delete(reason=f"Closed via request by {btn_interaction.user}")
+            except discord.Forbidden:
+                pass
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "UPDATE tickets SET status='closed' WHERE channel_id=?",
+                    (btn_interaction.channel.id,)
+                )
+                await db.commit()
+
+        @discord.ui.button(label="Keep Open", style=discord.ButtonStyle.secondary, emoji="✅")
+        async def keep_open(self, btn_interaction: discord.Interaction, button: discord.ui.Button):
+            await btn_interaction.response.edit_message(
+                content="✅ Ticket kept open.", embed=None, view=None
+            )
+
+    await interaction.response.send_message(embed=embed, view=ConfirmCloseView())
+
+
+@tree.command(name="close", description="Immediately close and delete this ticket (Staff only)")
+@app_commands.describe(reason="Reason for closing")
+async def ticket_close_cmd(interaction: discord.Interaction, reason: str = "Resolved"):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="🔒 Ticket Closing",
+        description=f"This ticket is being closed by {interaction.user.mention}.\n**Reason:** {reason}\n\nChannel will be deleted in 5 seconds.",
+        color=COLORS["red"]
+    )
+    embed.set_footer(text="TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tickets SET status='closed' WHERE channel_id=?",
+            (interaction.channel.id,)
+        )
+        await db.commit()
+
+    await asyncio.sleep(5)
+    try:
+        await interaction.channel.delete(reason=f"Ticket closed by {interaction.user}: {reason}")
+    except discord.Forbidden:
+        pass
+
+
+@tree.command(name="claim", description="Claim this ticket as your responsibility (Staff only)")
+async def ticket_claim_cmd(interaction: discord.Interaction):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE tickets SET claimed_by=? WHERE channel_id=?",
+            (interaction.user.id, interaction.channel.id)
+        )
+        await db.commit()
+
+    embed = discord.Embed(
+        title="🙋 Ticket Claimed",
+        description=f"{interaction.user.mention} has claimed this ticket and will handle your request.",
+        color=COLORS["blue"]
+    )
+    embed.set_footer(text="TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed)
+
+    try:
+        await interaction.channel.edit(name=f"claimed-{interaction.channel.name}", reason="Ticket claimed")
+    except Exception:
+        pass
+
+
+@tree.command(name="panel", description="Send the support ticket panel in this channel (Staff only)")
+async def ticket_panel_cmd(interaction: discord.Interaction):
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    sup_embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description=(
+            "If you **require support**, you may open a ticket.\n\n"
+            "• Prior to doing this, explore ways to resolve the issue yourself.\n"
+            "• Please have all necessary information ready before opening a ticket."
+        ),
+        color=COLORS["blue"]
+    )
+    sup_embed.set_footer(text="TestYourTier | TYT")
+    await interaction.response.send_message("✅ Posting ticket panel...", ephemeral=True)
+    await interaction.channel.send(embed=sup_embed, view=SupportTicketPanel())
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND – /ANNOUNCE
+# ─────────────────────────────────────────────
+@tree.command(name="announce", description="Send an announcement embed to a channel (Staff only)")
+@app_commands.describe(
+    channel="The channel to post in",
+    title="Announcement title",
+    message="Announcement body (use \\n for new lines)",
+    color="Embed colour: gold, blue, red, green, orange, purple, teal",
+    ping="Role to ping with the announcement (optional)",
+    image_url="Optional image URL to attach to the embed",
+)
+async def announce_cmd(
+    interaction: discord.Interaction,
+    channel: discord.TextChannel,
+    title: str,
+    message: str,
+    color: str = "gold",
+    ping: discord.Role = None,
+    image_url: str = None,
+):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    colour_val = COLORS.get(color.lower(), COLORS["gold"])
+    embed = discord.Embed(
+        title=title,
+        description=message.replace("\\n", "\n"),
+        color=colour_val,
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text=f"TYT Announcement • Posted by {interaction.user.display_name}")
+    if image_url:
+        embed.set_image(url=image_url)
+
+    content = ping.mention if ping else None
+    try:
+        await channel.send(content=content, embed=embed)
+        await interaction.followup.send(f"✅ Announcement posted in {channel.mention}.", ephemeral=True)
+        await log_event("ANNOUNCE", interaction.user.id, details=f"Channel:{channel.id} Title:{title}")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don't have permission to post in that channel.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ Failed to post: {e}", ephemeral=True)
+
 
 # ─────────────────────────────────────────────
 # EVENTS
