@@ -283,6 +283,21 @@ async def init_db():
         """)
         await db.commit()
         # ── Schema migrations for existing databases ─────────────
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tester_applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                guild_id INTEGER NOT NULL,
+                gamemode TEXT NOT NULL,
+                experience TEXT NOT NULL,
+                availability TEXT NOT NULL,
+                status TEXT DEFAULT 'pending',
+                reviewed_by INTEGER,
+                reviewed_at TEXT,
+                created_at TEXT NOT NULL
+            )
+        """)
+        await db.commit()
         for migration in [
             "ALTER TABLE tickets ADD COLUMN claimed_by INTEGER",
         ]:
@@ -3250,6 +3265,374 @@ async def botinfo_cmd(interaction: discord.Interaction):
 
 
 # ─────────────────────────────────────────────
+# SLASH COMMAND – /TESTERAPP
+# Apply to become a tester with modal form,
+# persistent approve/deny buttons for staff.
+# ─────────────────────────────────────────────
+
+class TesterAppModal(discord.ui.Modal, title="🎯 Tester Application"):
+    gamemode = discord.ui.TextInput(
+        label="Which gamemode do you want to test?",
+        placeholder="e.g. Sword, NethPot, UHC, Axe...",
+        max_length=50, required=True
+    )
+    experience = discord.ui.TextInput(
+        label="Describe your PvP experience",
+        style=discord.TextStyle.paragraph,
+        placeholder="How long have you played? Previous tester experience? Rank?",
+        max_length=500, required=True
+    )
+    availability = discord.ui.TextInput(
+        label="Your availability (days / hours / timezone)",
+        placeholder="e.g. Mon–Fri, 6–10 PM UTC",
+        max_length=200, required=True
+    )
+    timezone = discord.ui.TextInput(
+        label="Your timezone",
+        placeholder="e.g. UTC+5:30, EST, GMT",
+        max_length=30, required=True
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Prevent duplicate pending apps
+            async with db.execute(
+                "SELECT id FROM tester_applications WHERE user_id=? AND guild_id=? AND status='pending'",
+                (interaction.user.id, interaction.guild.id)
+            ) as cur:
+                existing = await cur.fetchone()
+            if existing:
+                await interaction.followup.send(
+                    "⚠️ You already have a **pending** tester application. Wait for staff to review it first.",
+                    ephemeral=True
+                )
+                return
+
+            await db.execute(
+                "INSERT INTO tester_applications (user_id, guild_id, gamemode, experience, availability, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (interaction.user.id, interaction.guild.id,
+                 self.gamemode.value, self.experience.value,
+                 f"{self.availability.value} ({self.timezone.value})", utcnow())
+            )
+            await db.commit()
+            async with db.execute("SELECT last_insert_rowid()") as cur:
+                app_id = (await cur.fetchone())[0]
+
+        await log_event("TESTER_APP", interaction.user.id, details=f"AppID:{app_id} GM:{self.gamemode.value}")
+
+        # Notify staff via configured channel or DM admins
+        cfg = await get_guild_config(interaction.guild.id)
+        staff_ch_id = cfg.get("staff_apps_channel") or cfg.get("support_channel")
+
+        app_embed = discord.Embed(
+            title=f"🎯 New Tester Application #{app_id}",
+            color=COLORS["purple"],
+            timestamp=datetime.now(timezone.utc)
+        )
+        app_embed.set_thumbnail(url=interaction.user.display_avatar.url)
+        app_embed.add_field(name="👤 Applicant", value=f"{interaction.user.mention} (`{interaction.user}`)", inline=True)
+        app_embed.add_field(name="🎮 Gamemode", value=self.gamemode.value, inline=True)
+        app_embed.add_field(name="🏅 Experience", value=self.experience.value, inline=False)
+        app_embed.add_field(name="🕒 Availability", value=f"{self.availability.value} · {self.timezone.value}", inline=False)
+        app_embed.set_footer(text=f"App ID: #{app_id} • Use /approvetesters or the buttons below")
+
+        view = TesterAppReviewView(app_id=app_id, applicant_id=interaction.user.id)
+
+        posted = False
+        if staff_ch_id:
+            ch = interaction.guild.get_channel(staff_ch_id)
+            if ch:
+                try:
+                    await ch.send(embed=app_embed, view=view)
+                    posted = True
+                except discord.Forbidden:
+                    pass
+
+        if not posted:
+            # Fallback: DM all members with Admin role
+            admin_role = discord.utils.get(interaction.guild.roles, name="TYT Admin") or \
+                         discord.utils.get(interaction.guild.roles, name="Admin") or \
+                         discord.utils.get(interaction.guild.roles, name="Ownership")
+            if admin_role:
+                for member in admin_role.members[:3]:
+                    try:
+                        await member.send(embed=app_embed, view=view)
+                    except discord.Forbidden:
+                        pass
+
+        await interaction.followup.send(
+            f"✅ **Application #{app_id} submitted!**\nStaff will review your application soon. "
+            "You'll receive a DM with the decision.",
+            ephemeral=True
+        )
+
+
+class TesterAppReviewView(discord.ui.View):
+    def __init__(self, app_id: int = 0, applicant_id: int = 0):
+        super().__init__(timeout=None)
+        self.app_id = app_id
+        self.applicant_id = applicant_id
+
+    @discord.ui.button(label="✅ Approve", style=discord.ButtonStyle.success, custom_id="tapp_approve")
+    async def approve_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_review(interaction, "approved")
+
+    @discord.ui.button(label="❌ Deny", style=discord.ButtonStyle.danger, custom_id="tapp_deny")
+    async def deny_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._handle_review(interaction, "denied")
+
+    async def _handle_review(self, interaction: discord.Interaction, decision: str):
+        if not has_ticket_perm(interaction.user):
+            await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+            return
+
+        # Find the app from the embed footer
+        app_id = self.app_id
+        if not app_id and interaction.message and interaction.message.embeds:
+            footer = interaction.message.embeds[0].footer.text or ""
+            import re as _re
+            m = _re.search(r"#(\d+)", footer)
+            if m:
+                app_id = int(m.group(1))
+
+        if not app_id:
+            await interaction.response.send_message("❌ Could not determine application ID.", ephemeral=True)
+            return
+
+        await interaction.response.defer()
+
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute(
+                "SELECT user_id, gamemode FROM tester_applications WHERE id=?", (app_id,)
+            ) as cur:
+                row = await cur.fetchone()
+            if not row:
+                await interaction.followup.send(f"❌ Application #{app_id} not found.", ephemeral=True)
+                return
+            if row is None:
+                await interaction.followup.send("❌ Application not found.", ephemeral=True)
+                return
+            applicant_id, gamemode = row
+            await db.execute(
+                "UPDATE tester_applications SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?",
+                (decision, interaction.user.id, utcnow(), app_id)
+            )
+            await db.commit()
+
+        color = COLORS["green"] if decision == "approved" else COLORS["red"]
+        icon = "✅" if decision == "approved" else "❌"
+
+        # Update the original message
+        result_embed = discord.Embed(
+            title=f"{icon} Tester Application #{app_id} — {decision.upper()}",
+            color=color,
+            timestamp=datetime.now(timezone.utc)
+        )
+        result_embed.add_field(name="Reviewed by", value=interaction.user.mention, inline=True)
+        result_embed.add_field(name="Gamemode", value=gamemode, inline=True)
+        result_embed.set_footer(text=f"App ID: #{app_id}")
+        await interaction.message.edit(embed=result_embed, view=None)
+
+        # DM the applicant
+        applicant = interaction.guild.get_member(applicant_id)
+        if applicant:
+            try:
+                dm = discord.Embed(
+                    title=f"{icon} Tester Application {decision.capitalize()}",
+                    description=(
+                        f"Your tester application for **{gamemode}** in **{interaction.guild.name}** has been **{decision}**!\n\n"
+                        + ("Welcome to the tester team! A staff member will assign your role shortly." if decision == "approved"
+                           else "Thank you for applying. You may apply again in the future.")
+                    ),
+                    color=color
+                )
+                dm.set_footer(text="TestYourTier | TYT")
+                await applicant.send(embed=dm)
+            except discord.Forbidden:
+                pass
+
+        await log_event("TESTER_APP_REVIEW", applicant_id, details=f"AppID:{app_id} Decision:{decision} By:{interaction.user.id}")
+        await interaction.followup.send(
+            f"{icon} Application #{app_id} **{decision}**. Applicant has been notified.", ephemeral=True
+        )
+
+
+@tree.command(name="testerapp", description="Apply to become a TYT tester")
+async def testerapp_cmd(interaction: discord.Interaction):
+    # Check if already a tester
+    if has_tester_role(interaction.user):
+        await interaction.response.send_message("⚠️ You are already a tester!", ephemeral=True)
+        return
+    await interaction.response.send_modal(TesterAppModal())
+
+
+@tree.command(name="testerapp_review", description="Review a tester application by ID (Staff only)")
+@app_commands.describe(app_id="Application ID", decision="approve or deny")
+@app_commands.choices(decision=[
+    app_commands.Choice(name="approve", value="approved"),
+    app_commands.Choice(name="deny", value="denied"),
+])
+async def testerapp_review_cmd(interaction: discord.Interaction, app_id: int, decision: str):
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, gamemode, status FROM tester_applications WHERE id=? AND guild_id=?",
+            (app_id, interaction.guild.id)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await interaction.followup.send(f"❌ Application #{app_id} not found.", ephemeral=True)
+            return
+        if row[2] != "pending":
+            await interaction.followup.send(f"⚠️ Application #{app_id} already {row[2]}.", ephemeral=True)
+            return
+        await db.execute(
+            "UPDATE tester_applications SET status=?, reviewed_by=?, reviewed_at=? WHERE id=?",
+            (decision, interaction.user.id, utcnow(), app_id)
+        )
+        await db.commit()
+
+    applicant = interaction.guild.get_member(row[0])
+    icon = "✅" if decision == "approved" else "❌"
+    if applicant:
+        try:
+            dm = discord.Embed(
+                title=f"{icon} Tester Application {decision.capitalize()}",
+                description=f"Your tester application for **{row[1]}** has been **{decision}**!\n\n" +
+                            ("Welcome to the team! A staff member will assign your tester role shortly." if decision == "approved"
+                             else "Thank you for applying. You may reapply in the future."),
+                color=COLORS["green"] if decision == "approved" else COLORS["red"]
+            )
+            dm.set_footer(text="TestYourTier | TYT")
+            await applicant.send(embed=dm)
+        except discord.Forbidden:
+            pass
+
+    await interaction.followup.send(
+        f"{icon} Application #{app_id} **{decision}**. "
+        + (f"{applicant.mention} has been notified." if applicant else "Applicant not found in server."),
+        ephemeral=True
+    )
+
+
+@tree.command(name="pendingapps", description="View all pending tester applications (Staff only)")
+async def pendingapps_cmd(interaction: discord.Interaction):
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, user_id, gamemode, created_at FROM tester_applications WHERE guild_id=? AND status='pending' ORDER BY id",
+            (interaction.guild.id,)
+        ) as cur:
+            apps = await cur.fetchall()
+
+    embed = discord.Embed(
+        title="📋 Pending Tester Applications",
+        color=COLORS["purple"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    if not apps:
+        embed.description = "✅ No pending applications."
+    else:
+        for app_id, uid, gm, ts in apps:
+            member = interaction.guild.get_member(uid)
+            name = member.mention if member else f"ID:{uid}"
+            embed.add_field(
+                name=f"#{app_id} — {gm}",
+                value=f"{name}\nApplied: {ts}\nUse `/testerapp_review {app_id} approve/deny`",
+                inline=False
+            )
+    embed.set_footer(text=f"{len(apps)} pending • TestYourTier | TYT")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND GROUP – /AUTOROLE
+# Automatically assign roles when a member joins.
+# ─────────────────────────────────────────────
+autorole_group = app_commands.Group(name="autorole", description="Manage auto-assigned join roles (Admin only)")
+
+
+@autorole_group.command(name="add", description="Add a role to auto-assign when someone joins")
+@app_commands.describe(role="The role to auto-assign on join")
+async def autorole_add(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator only.", ephemeral=True)
+        return
+    cfg = await get_guild_config(interaction.guild.id)
+    current = cfg.get("autoroles", [])
+    if role.id in current:
+        await interaction.response.send_message(f"⚠️ {role.mention} is already an auto-role.", ephemeral=True)
+        return
+    current.append(role.id)
+    cfg["autoroles"] = current
+    await set_guild_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(
+        f"✅ {role.mention} will now be assigned to every new member who joins.", ephemeral=True
+    )
+
+
+@autorole_group.command(name="remove", description="Remove a role from auto-assign")
+@app_commands.describe(role="The role to remove from auto-assign")
+async def autorole_remove(interaction: discord.Interaction, role: discord.Role):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator only.", ephemeral=True)
+        return
+    cfg = await get_guild_config(interaction.guild.id)
+    current = cfg.get("autoroles", [])
+    if role.id not in current:
+        await interaction.response.send_message(f"⚠️ {role.mention} is not an auto-role.", ephemeral=True)
+        return
+    current.remove(role.id)
+    cfg["autoroles"] = current
+    await set_guild_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"✅ {role.mention} removed from auto-roles.", ephemeral=True)
+
+
+@autorole_group.command(name="list", description="Show all configured auto-roles")
+async def autorole_list(interaction: discord.Interaction):
+    cfg = await get_guild_config(interaction.guild.id)
+    current = cfg.get("autoroles", [])
+    if not current:
+        await interaction.response.send_message("ℹ️ No auto-roles configured. Use `/autorole add @role`.", ephemeral=True)
+        return
+    roles = [interaction.guild.get_role(rid) for rid in current]
+    roles = [r for r in roles if r]
+    embed = discord.Embed(
+        title="🎭 Auto-Roles on Join",
+        description="\n".join(f"• {r.mention} (`{r.name}`)" for r in roles) or "None",
+        color=COLORS["blue"]
+    )
+    embed.set_footer(text="TestYourTier | TYT • These roles are assigned when a new member joins")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@autorole_group.command(name="clear", description="Remove ALL auto-roles (Admin only)")
+async def autorole_clear(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator only.", ephemeral=True)
+        return
+    cfg = await get_guild_config(interaction.guild.id)
+    count = len(cfg.get("autoroles", []))
+    cfg["autoroles"] = []
+    await set_guild_config(interaction.guild.id, cfg)
+    await interaction.response.send_message(f"✅ Cleared {count} auto-role(s).", ephemeral=True)
+
+
+tree.add_command(autorole_group)
+
+
+# ─────────────────────────────────────────────
 # EVENTS
 # ─────────────────────────────────────────────
 @bot.event
@@ -3270,6 +3653,7 @@ async def on_ready():
     bot.add_view(SupportTicketPanel())
     bot.add_view(ReportTicketPanel())
     bot.add_view(TicketControlView())
+    bot.add_view(TesterAppReviewView())
 
     try:
         synced = await tree.sync()
@@ -3278,6 +3662,30 @@ async def on_ready():
         logger.error(f"Failed to sync commands: {e}")
 
     logger.info(f"TYT Bot Online — {bot.user} ({bot.user.id}) — {len(bot.guilds)} guild(s)")
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    """Auto-assign configured roles when a new member joins."""
+    if member.bot:
+        return
+    cfg = await get_guild_config(member.guild.id)
+    autoroles = cfg.get("autoroles", [])
+    if not autoroles:
+        return
+    roles_to_add = []
+    for role_id in autoroles:
+        role = member.guild.get_role(role_id)
+        if role:
+            roles_to_add.append(role)
+    if roles_to_add:
+        try:
+            await member.add_roles(*roles_to_add, reason="Auto-role on join")
+            logger.info(f"Auto-roles assigned to {member} in {member.guild.name}: {[r.name for r in roles_to_add]}")
+        except discord.Forbidden:
+            logger.warning(f"Missing permissions to assign auto-roles in {member.guild.name}")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to assign auto-roles to {member}: {e}")
 
 
 @bot.event
