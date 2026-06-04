@@ -2416,6 +2416,400 @@ async def announce_cmd(
 
 
 # ─────────────────────────────────────────────
+# SLASH COMMAND – /REMOVEWAITLIST
+# ─────────────────────────────────────────────
+@tree.command(name="removewaitlist", description="Remove a player from a gamemode waitlist (Staff only)")
+@app_commands.describe(
+    player="The player to remove from the waitlist",
+    gamemode="The gamemode waitlist to remove them from",
+)
+@app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm) for gm in GAMEMODES])
+async def removewaitlist_cmd(interaction: discord.Interaction, player: discord.Member, gamemode: str):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    removed = []
+    not_found = []
+
+    # Remove waitlist role by name
+    wl_name = WAITLIST_ROLE_MAP.get(gamemode)
+    if wl_name:
+        wl_role = get_role_by_name(guild, wl_name)
+        if wl_role and wl_role in player.roles:
+            try:
+                await player.remove_roles(wl_role, reason=f"Removed from {gamemode} waitlist by {interaction.user}")
+                removed.append(wl_name)
+            except (discord.Forbidden, discord.HTTPException) as e:
+                not_found.append(f"`{wl_name}` (error: {e})")
+        elif wl_role:
+            not_found.append(f"`{wl_name}` (player didn't have it)")
+
+    # Remove queue ping role by name
+    q_name = QUEUE_ROLE_MAP.get(gamemode)
+    if q_name:
+        q_role = get_role_by_name(guild, q_name)
+        if q_role and q_role in player.roles:
+            try:
+                await player.remove_roles(q_role, reason=f"Removed queue role for {gamemode}")
+                removed.append(q_name)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    # Also remove config-based role ID if present
+    cfg_role_id = cfg.get(f"waitlist_role_{gamemode.lower()}")
+    if cfg_role_id:
+        cfg_role = guild.get_role(cfg_role_id)
+        if cfg_role and cfg_role in player.roles:
+            try:
+                await player.remove_roles(cfg_role, reason=f"Removed from {gamemode} waitlist")
+                if cfg_role.name not in removed:
+                    removed.append(cfg_role.name)
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    await log_event("WAITLIST_REMOVE", player.id, gamemode, details=f"By:{interaction.user.id} Removed:{removed}")
+
+    embed = discord.Embed(
+        title="🚫 Removed from Waitlist",
+        description=f"{player.mention} has been removed from the **{GAMEMODE_EMOJIS.get(gamemode, '⚔️')} {gamemode}** waitlist.",
+        color=COLORS["red"]
+    )
+    if removed:
+        embed.add_field(name="🏷️ Roles Removed", value="\n".join(f"• `{r}`" for r in removed), inline=False)
+    if not_found:
+        embed.add_field(name="⚠️ Notes", value="\n".join(not_found), inline=False)
+    embed.set_footer(text=f"TestYourTier | TYT • Action by {interaction.user.display_name}")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND – /PURGE
+# ─────────────────────────────────────────────
+@tree.command(name="purge", description="Delete messages in this channel (Staff only)")
+@app_commands.describe(amount="Number of messages to delete (1–100)")
+async def purge_cmd(interaction: discord.Interaction, amount: int):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    if not 1 <= amount <= 100:
+        await interaction.response.send_message("❌ Amount must be between 1 and 100.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        deleted = await interaction.channel.purge(limit=amount)
+        await interaction.followup.send(f"🗑️ Deleted **{len(deleted)}** message(s).", ephemeral=True)
+        await log_event("PURGE", interaction.user.id, details=f"Channel:{interaction.channel.id} Count:{len(deleted)}")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ I don't have Manage Messages permission here.", ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND – /TRANSCRIPT
+# ─────────────────────────────────────────────
+@tree.command(name="transcript", description="Export this ticket's chat as a text file (Staff only)")
+async def transcript_cmd(interaction: discord.Interaction):
+    ticket = await _get_ticket_by_channel(interaction.channel.id)
+    if not ticket:
+        await interaction.response.send_message("❌ This command can only be used inside a ticket channel.", ephemeral=True)
+        return
+    if not has_ticket_perm(interaction.user):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    lines = [f"=== TYT Ticket Transcript — #{interaction.channel.name} ===",
+             f"Exported by: {interaction.user} at {utcnow()}",
+             "=" * 55, ""]
+
+    try:
+        async for msg in interaction.channel.history(limit=500, oldest_first=True):
+            ts = msg.created_at.strftime("%Y-%m-%d %H:%M:%S UTC")
+            content = msg.content or ""
+            if msg.embeds:
+                content += f" [Embed: {msg.embeds[0].title or 'untitled'}]"
+            if msg.attachments:
+                content += f" [Attachment: {msg.attachments[0].url}]"
+            lines.append(f"[{ts}] {msg.author.display_name}: {content}")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Cannot read channel history.", ephemeral=True)
+        return
+
+    transcript_text = "\n".join(lines)
+    import io
+    file = discord.File(
+        io.BytesIO(transcript_text.encode("utf-8")),
+        filename=f"transcript-{interaction.channel.name}.txt"
+    )
+    await interaction.followup.send("📄 Ticket transcript:", file=file, ephemeral=True)
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND – /SERVERINFO
+# ─────────────────────────────────────────────
+@tree.command(name="serverinfo", description="Show TYT server statistics")
+async def serverinfo_cmd(interaction: discord.Interaction):
+    guild = interaction.guild
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM users") as cur: users = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM player_ranks WHERE current_tier != 'Unranked'") as cur: ranked = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM test_logs") as cur: tests = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM tickets") as cur: tickets_total = (await cur.fetchone())[0]
+        async with db.execute("SELECT COUNT(*) FROM queue_sessions WHERE status='open'") as cur: open_q = (await cur.fetchone())[0]
+        async with db.execute(
+            "SELECT gamemode, COUNT(*) as c FROM test_logs GROUP BY gamemode ORDER BY c DESC LIMIT 1"
+        ) as cur:
+            top_gm_row = await cur.fetchone()
+
+    top_gm = f"{top_gm_row[0]} ({top_gm_row[1]} tests)" if top_gm_row else "N/A"
+
+    embed = discord.Embed(title=f"📊 {guild.name} — TYT Statistics", color=COLORS["gold"])
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    embed.add_field(name="👥 Members", value=str(guild.member_count), inline=True)
+    embed.add_field(name="📋 Registered Players", value=str(users), inline=True)
+    embed.add_field(name="🏆 Ranked Players", value=str(ranked), inline=True)
+    embed.add_field(name="⚔️ Tests Logged", value=str(tests), inline=True)
+    embed.add_field(name="🎫 Total Tickets", value=str(tickets_total), inline=True)
+    embed.add_field(name="🟢 Open Queues", value=str(open_q), inline=True)
+    embed.add_field(name="🔥 Most Active Gamemode", value=top_gm, inline=True)
+    embed.add_field(name="🎮 Gamemodes", value=" • ".join(GAMEMODES), inline=False)
+    embed.set_footer(text="TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed)
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMAND – /AUTOSETUP
+# One-click full server setup: auto-detects channels + roles by name,
+# writes guild_config, posts all panels.
+# ─────────────────────────────────────────────
+
+# Channel name keywords — tries each variant, picks the first match
+_CHAN_PATTERNS = {
+    "request_test_channel": ["request-test", "requesttest", "request_test", "queue-register", "register-test", "waitlist-register", "register"],
+    "results_channel":      ["results", "test-results", "testing-results", "tyt-results", "result"],
+    "rubrics_channel":      ["rubrics", "ranked-rubrics", "rubric", "rubrics-ranked"],
+    "ruleset_channel":      ["ruleset", "ranked-ruleset", "rules", "tierlist-rules", "tl-rules"],
+    "migrations_channel":   ["migrations", "migration-requests", "migration", "rank-migration"],
+    "support_channel":      ["support", "request-support", "support-tickets", "open-ticket", "create-ticket"],
+    "report_channel":       ["report", "reports", "report-tickets", "staff-report", "reports-tickets"],
+}
+
+_WAITLIST_CHAN_PATTERNS = {
+    "UHC":     ["uhc-waitlist", "uhc_waitlist", "waitlist-uhc"],
+    "Sword":   ["sword-waitlist", "sword_waitlist", "waitlist-sword"],
+    "Axe":     ["axe-waitlist", "axe_waitlist", "waitlist-axe", "axe-shield-waitlist"],
+    "NethPot": ["nethpot-waitlist", "neth-pot-waitlist", "nethpot_waitlist", "waitlist-nethpot", "np-waitlist"],
+    "DiaPot":  ["diapot-waitlist", "dia-pot-waitlist", "diapot_waitlist", "waitlist-diapot", "dp-waitlist"],
+    "SMP":     ["smp-waitlist", "smp_waitlist", "waitlist-smp"],
+    "Mace":    ["mace-waitlist", "mace_waitlist", "waitlist-mace"],
+    "CPvP":    ["cpvp-waitlist", "cpvp_waitlist", "waitlist-cpvp", "crystal-waitlist", "crystalpvp-waitlist"],
+}
+
+_ROLE_PATTERNS = {
+    "staff_role":  ["TYT Staff", "Staff", "TYT Admin"],
+    "tester_role": ["TYT Tester", "Tier Testers", "TYT High Tester"],
+    "admin_role":  ["TYT Admin", "Admin", "Ownership"],
+}
+
+_TICKET_CAT_PATTERNS = ["tickets", "support-tickets", "ticket", "support", "staff-tickets"]
+
+
+def _find_channel(guild: discord.Guild, patterns: list[str]) -> discord.TextChannel | None:
+    all_text = {c.name.lower(): c for c in guild.text_channels}
+    for p in patterns:
+        if p.lower() in all_text:
+            return all_text[p.lower()]
+    # Fuzzy: any channel whose name contains the first pattern keyword
+    for p in patterns:
+        for name, ch in all_text.items():
+            if p.lower() in name:
+                return ch
+    return None
+
+
+def _find_role(guild: discord.Guild, names: list[str]) -> discord.Role | None:
+    for name in names:
+        r = discord.utils.get(guild.roles, name=name)
+        if r:
+            return r
+    return None
+
+
+def _find_category(guild: discord.Guild, patterns: list[str]) -> discord.CategoryChannel | None:
+    all_cats = {c.name.lower(): c for c in guild.categories}
+    for p in patterns:
+        if p.lower() in all_cats:
+            return all_cats[p.lower()]
+    for p in patterns:
+        for name, cat in all_cats.items():
+            if p.lower() in name:
+                return cat
+    return None
+
+
+@tree.command(name="autosetup", description="⚡ One-click full TYT server setup — auto-detects channels & roles (Admin only)")
+async def autosetup_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Administrator permission required.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    cfg = await get_guild_config(guild.id)
+
+    found = []
+    missing = []
+
+    # ── 1. Main channels ───────────────────────────────────────
+    for cfg_key, patterns in _CHAN_PATTERNS.items():
+        ch = _find_channel(guild, patterns)
+        if ch:
+            cfg[cfg_key] = ch.id
+            found.append(f"✅ `{cfg_key.replace('_', ' ').title()}` → {ch.mention}")
+        else:
+            missing.append(f"❌ `{cfg_key}` — create a channel named `{patterns[0]}`")
+
+    # ── 2. Waitlist channels ───────────────────────────────────
+    for gm, patterns in _WAITLIST_CHAN_PATTERNS.items():
+        ch = _find_channel(guild, patterns)
+        if ch:
+            cfg[f"waitlist_chan_{gm.lower()}"] = ch.id
+            found.append(f"✅ `{gm} waitlist chan` → {ch.mention}")
+        else:
+            missing.append(f"⚠️ `{gm} waitlist` — create a channel named `{patterns[0]}`")
+
+    # ── 3. Roles ───────────────────────────────────────────────
+    for cfg_key, names in _ROLE_PATTERNS.items():
+        role = _find_role(guild, names)
+        if role:
+            cfg[cfg_key] = role.id
+            found.append(f"✅ `{cfg_key}` → {role.mention}")
+        else:
+            missing.append(f"⚠️ `{cfg_key}` — create a role named `{names[0]}`")
+
+    # ── 4. Tickets category ────────────────────────────────────
+    cat = _find_category(guild, _TICKET_CAT_PATTERNS)
+    if cat:
+        cfg["tickets_category"] = cat.id
+        found.append(f"✅ `tickets_category` → **{cat.name}**")
+    else:
+        missing.append("⚠️ `tickets_category` — create a category named `tickets`")
+
+    # ── Save config ────────────────────────────────────────────
+    await set_guild_config(guild.id, cfg)
+
+    # ── 5. Post panels to detected channels ───────────────────
+    panels_posted = []
+    panels_skipped = []
+
+    async def post_autosetup_panel(cfg_key: str, embed: discord.Embed, view: discord.ui.View, label: str):
+        ch_id = cfg.get(cfg_key)
+        if not ch_id:
+            panels_skipped.append(f"⚠️ {label} — channel not configured")
+            return
+        ch = guild.get_channel(ch_id)
+        if not ch:
+            panels_skipped.append(f"⚠️ {label} — channel not found")
+            return
+        try:
+            await ch.send(embed=embed, view=view)
+            panels_posted.append(f"✅ {label} → {ch.mention}")
+        except discord.Forbidden:
+            panels_skipped.append(f"❌ {label} — no permission in {ch.mention}")
+
+    request_embed = discord.Embed(
+        title="⚔️ Test Your Tier — Request a Test",
+        description=(
+            "**Welcome to TestYourTier!**\n\n"
+            "Register your profile and join the waitlist for your gamemode.\n"
+            "Once a tester opens queue, join and get tested!\n\n"
+            "**Gamemodes:** " + " • ".join(f"{GAMEMODE_EMOJIS[gm]} {gm}" for gm in GAMEMODES)
+        ),
+        color=COLORS["dark"]
+    )
+    request_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("request_test_channel", request_embed, WaitlistPanel(), "Waitlist Panel")
+
+    rubrics_embed = discord.Embed(
+        title="Ranked Rubrics 🏆",
+        description="These are the ranked rubrics for all game modes. Players and testers should follow the scores in the game mode by following the Rubrics.",
+        color=COLORS["gold"]
+    )
+    rubrics_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("rubrics_channel", rubrics_embed, RubricsPanel(), "Rubrics Panel")
+
+    ruleset_embed = discord.Embed(
+        title="Tierlist Ruleset 🥇",
+        description="Tierlists Rules are applied to every Tierlist fight ensuring proper and fair advantages over the players.",
+        color=COLORS["teal"]
+    )
+    ruleset_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("ruleset_channel", ruleset_embed, RulesetPanel(), "Ruleset Panel")
+
+    mig_embed = discord.Embed(
+        title="🔄 Gamemode Migrations",
+        description=(
+            "Migrate your ranks to TestYourTier - (LT3+)\n\n"
+            "**Requirements:** LT3+, not tested here before, result within 4 months, proper proof."
+        ),
+        color=COLORS["teal"]
+    )
+    mig_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("migrations_channel", mig_embed, MigrationsPanel(), "Migrations Panel")
+
+    sup_embed = discord.Embed(
+        title="🎫 Support Tickets",
+        description="If you **require support**, you may open a ticket.\n\n• Please have all necessary information ready before opening a ticket.",
+        color=COLORS["blue"]
+    )
+    sup_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("support_channel", sup_embed, SupportTicketPanel(), "Support Panel")
+
+    rep_embed = discord.Embed(
+        title="🚩 Report Tickets",
+        description="Open a ticket to report a staff/tester member.\n\n• Concrete evidence required.",
+        color=COLORS["red"]
+    )
+    rep_embed.set_footer(text="TestYourTier | TYT")
+    await post_autosetup_panel("report_channel", rep_embed, ReportTicketPanel(), "Report Panel")
+
+    # ── Build summary embed ────────────────────────────────────
+    embed = discord.Embed(
+        title="⚡ AutoSetup Complete",
+        description=f"Configured **{len(found)}** items. See below for details.",
+        color=COLORS["green"] if not missing else COLORS["orange"],
+        timestamp=datetime.now(timezone.utc)
+    )
+
+    if found:
+        # Split into chunks if too long
+        found_text = "\n".join(found)
+        for i in range(0, len(found_text), 1000):
+            embed.add_field(name="✅ Configured" if i == 0 else "✅ Configured (cont.)", value=found_text[i:i+1000], inline=False)
+
+    if panels_posted:
+        embed.add_field(name="📌 Panels Posted", value="\n".join(panels_posted), inline=False)
+
+    if panels_skipped:
+        embed.add_field(name="⚠️ Panels Skipped", value="\n".join(panels_skipped), inline=False)
+
+    if missing:
+        missing_text = "\n".join(missing)
+        for i in range(0, len(missing_text), 1000):
+            embed.add_field(name="❌ Not Found" if i == 0 else "❌ Not Found (cont.)", value=missing_text[i:i+1000], inline=False)
+
+    embed.set_footer(text="TestYourTier | TYT • Run /autosetup again after creating missing channels/roles")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    await log_event("AUTOSETUP", interaction.user.id, details=f"Found:{len(found)} Missing:{len(missing)}")
+
+
+# ─────────────────────────────────────────────
 # EVENTS
 # ─────────────────────────────────────────────
 @bot.event

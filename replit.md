@@ -56,17 +56,30 @@ A production-grade Discord bot for operating a Minecraft PvP ranking community â
 | Command | Description | Access |
 |---|---|---|
 | `/profile` | View player profile & rankings | Everyone |
+| `/results @user` | View tier rankings with MC skin | Everyone |
 | `/leaderboard` | Top players per gamemode | Everyone |
 | `/cooldown` | Check testing cooldown | Everyone |
 | `/queuestatus` | See all open queues | Everyone |
+| `/serverinfo` | Server statistics dashboard | Everyone |
 | `/queue open/close` | Open or close a queue | Tester/Staff |
 | `/nextplayer` | Advance queue to next player | Tester/Staff |
-| `/logtest` | Log a completed test & assign tier | Tester/Staff |
+| `/resultsubmit` | Submit test result & assign tier | Tester/Staff |
 | `/timeout_player` | Remove player from queue | Tester/Staff |
+| `/removewaitlist @user` | Remove player from waitlist | Staff |
 | `/setrank` | Manually set player tier | Staff |
 | `/staff_stats` | View tester activity | Staff |
 | `/migration_review` | Approve/deny migration requests | Staff |
-| `/setup *` | Full server configuration | Admin |
+| `/add @user` | Add user to ticket channel | Staff |
+| `/remove @user` | Remove user from ticket channel | Staff |
+| `/claim` | Claim ticket ownership | Staff |
+| `/requestclose` | Request ticket closure | Staff |
+| `/close` | Close & delete ticket immediately | Staff |
+| `/panel` | Post ticket panel in channel | Staff |
+| `/transcript` | Export ticket as .txt file | Staff |
+| `/purge [n]` | Delete up to 100 messages | Staff |
+| `/announce` | Post announcement embed | Staff |
+| `/autosetup` | âš¡ One-click full server setup | Admin |
+| `/setup *` | Manual server configuration | Admin |
 
 ## User preferences
 
