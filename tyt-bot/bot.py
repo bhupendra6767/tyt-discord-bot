@@ -261,12 +261,36 @@ async def init_db():
             )
         """)
         await db.commit()
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                guild_id INTEGER NOT NULL
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS staff_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                author_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                guild_id INTEGER NOT NULL
+            )
+        """)
+        await db.commit()
         # ── Schema migrations for existing databases ─────────────
-        try:
-            await db.execute("ALTER TABLE tickets ADD COLUMN claimed_by INTEGER")
-            await db.commit()
-        except Exception:
-            pass  # Column already exists — safe to ignore
+        for migration in [
+            "ALTER TABLE tickets ADD COLUMN claimed_by INTEGER",
+        ]:
+            try:
+                await db.execute(migration)
+                await db.commit()
+            except Exception:
+                pass  # Column already exists — safe to ignore
     logger.info("Database initialized.")
 
 
@@ -2807,6 +2831,422 @@ async def autosetup_cmd(interaction: discord.Interaction):
     embed.set_footer(text="TestYourTier | TYT • Run /autosetup again after creating missing channels/roles")
     await interaction.followup.send(embed=embed, ephemeral=True)
     await log_event("AUTOSETUP", interaction.user.id, details=f"Found:{len(found)} Missing:{len(missing)}")
+
+
+# ─────────────────────────────────────────────
+# SLASH COMMANDS – MODERATION
+# /warn /warnings /unwarn /note /staffnotes
+# /lock /unlock /slowmode /dm /stafflist
+# ─────────────────────────────────────────────
+
+@tree.command(name="warn", description="Issue a warning to a player (Staff only)")
+@app_commands.describe(player="The player to warn", reason="Reason for the warning")
+async def warn_cmd(interaction: discord.Interaction, player: discord.Member, reason: str):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    if player.bot:
+        await interaction.response.send_message("❌ Cannot warn bots.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO warnings (user_id, moderator_id, reason, created_at, guild_id) VALUES (?, ?, ?, ?, ?)",
+            (player.id, interaction.user.id, reason, utcnow(), interaction.guild.id)
+        )
+        await db.commit()
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?",
+            (player.id, interaction.guild.id)
+        ) as cur:
+            total = (await cur.fetchone())[0]
+
+    # DM the warned player
+    try:
+        dm_embed = discord.Embed(
+            title="⚠️ You have received a warning",
+            description=f"You were warned in **{interaction.guild.name}**.",
+            color=COLORS["orange"]
+        )
+        dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Moderator", value=interaction.user.display_name, inline=True)
+        dm_embed.add_field(name="Total Warnings", value=str(total), inline=True)
+        dm_embed.set_footer(text="TestYourTier | TYT")
+        await player.send(embed=dm_embed)
+        dm_status = "✅ DM sent"
+    except discord.Forbidden:
+        dm_status = "⚠️ DMs closed — could not notify"
+
+    embed = discord.Embed(
+        title="⚠️ Warning Issued",
+        color=COLORS["orange"]
+    )
+    embed.add_field(name="Player", value=player.mention, inline=True)
+    embed.add_field(name="Total Warnings", value=str(total), inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    embed.add_field(name="DM Status", value=dm_status, inline=False)
+    embed.set_footer(text=f"Issued by {interaction.user.display_name} • TestYourTier | TYT")
+    await interaction.followup.send(embed=embed)
+    await log_event("WARN", player.id, details=f"By:{interaction.user.id} Reason:{reason}")
+
+
+@tree.command(name="warnings", description="View a player's warning history (Staff only)")
+@app_commands.describe(player="The player to check")
+async def warnings_cmd(interaction: discord.Interaction, player: discord.Member):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, moderator_id, reason, created_at FROM warnings WHERE user_id = ? AND guild_id = ? ORDER BY id DESC LIMIT 10",
+            (player.id, interaction.guild.id)
+        ) as cur:
+            warns = await cur.fetchall()
+
+    embed = discord.Embed(
+        title=f"⚠️ Warnings — {player.display_name}",
+        color=COLORS["orange"] if warns else COLORS["green"]
+    )
+    embed.set_thumbnail(url=player.display_avatar.url)
+    if not warns:
+        embed.description = "✅ No warnings on record."
+    else:
+        for warn_id, mod_id, reason, ts in warns:
+            mod = interaction.guild.get_member(mod_id)
+            mod_name = mod.display_name if mod else f"ID:{mod_id}"
+            embed.add_field(
+                name=f"#{warn_id} — {ts}",
+                value=f"**Reason:** {reason}\n**By:** {mod_name}",
+                inline=False
+            )
+    embed.set_footer(text=f"Total: {len(warns)} shown (max 10) • TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="unwarn", description="Remove a specific warning by ID (Staff only)")
+@app_commands.describe(warning_id="The warning ID to remove (get it from /warnings)")
+async def unwarn_cmd(interaction: discord.Interaction, warning_id: int):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, reason FROM warnings WHERE id = ? AND guild_id = ?",
+            (warning_id, interaction.guild.id)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            await interaction.response.send_message(f"❌ Warning #{warning_id} not found.", ephemeral=True)
+            return
+        await db.execute("DELETE FROM warnings WHERE id = ?", (warning_id,))
+        await db.commit()
+
+    user = interaction.guild.get_member(row[0])
+    user_str = user.mention if user else f"ID:{row[0]}"
+    await interaction.response.send_message(
+        f"✅ Warning **#{warning_id}** removed.\n**Player:** {user_str}\n**Original reason:** {row[1]}",
+        ephemeral=True
+    )
+
+
+@tree.command(name="note", description="Add a private staff note about a player (Staff only)")
+@app_commands.describe(player="The player to add a note about", note="The staff note")
+async def note_cmd(interaction: discord.Interaction, player: discord.Member, note: str):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO staff_notes (user_id, author_id, note, created_at, guild_id) VALUES (?, ?, ?, ?, ?)",
+            (player.id, interaction.user.id, note, utcnow(), interaction.guild.id)
+        )
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"📝 Note saved for {player.mention}.", ephemeral=True
+    )
+
+
+@tree.command(name="staffnotes", description="View private staff notes about a player (Staff only)")
+@app_commands.describe(player="The player to check notes for")
+async def staffnotes_cmd(interaction: discord.Interaction, player: discord.Member):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, author_id, note, created_at FROM staff_notes WHERE user_id = ? AND guild_id = ? ORDER BY id DESC LIMIT 10",
+            (player.id, interaction.guild.id)
+        ) as cur:
+            notes = await cur.fetchall()
+
+    embed = discord.Embed(
+        title=f"📝 Staff Notes — {player.display_name}",
+        color=COLORS["purple"]
+    )
+    embed.set_thumbnail(url=player.display_avatar.url)
+    if not notes:
+        embed.description = "No notes on record."
+    else:
+        for note_id, author_id, note_text, ts in notes:
+            author = interaction.guild.get_member(author_id)
+            author_name = author.display_name if author else f"ID:{author_id}"
+            embed.add_field(
+                name=f"#{note_id} — {ts} by {author_name}",
+                value=note_text,
+                inline=False
+            )
+    embed.set_footer(text="Staff-only • TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@tree.command(name="lock", description="Lock the current channel so only staff can send messages (Staff only)")
+@app_commands.describe(reason="Reason for locking")
+async def lock_cmd(interaction: discord.Interaction, reason: str = "Locked by staff"):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    try:
+        await interaction.channel.set_permissions(
+            interaction.guild.default_role,
+            send_messages=False,
+            reason=f"Locked by {interaction.user}: {reason}"
+        )
+        embed = discord.Embed(
+            title="🔒 Channel Locked",
+            description=f"This channel has been locked by {interaction.user.mention}.\n**Reason:** {reason}",
+            color=COLORS["red"]
+        )
+        embed.set_footer(text="TestYourTier | TYT • Use /unlock to reopen")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing permissions to lock this channel.", ephemeral=True)
+
+
+@tree.command(name="unlock", description="Unlock the current channel (Staff only)")
+async def unlock_cmd(interaction: discord.Interaction):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    try:
+        await interaction.channel.set_permissions(
+            interaction.guild.default_role,
+            send_messages=None,
+            reason=f"Unlocked by {interaction.user}"
+        )
+        embed = discord.Embed(
+            title="🔓 Channel Unlocked",
+            description=f"This channel has been unlocked by {interaction.user.mention}.",
+            color=COLORS["green"]
+        )
+        embed.set_footer(text="TestYourTier | TYT")
+        await interaction.response.send_message(embed=embed)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing permissions to unlock this channel.", ephemeral=True)
+
+
+@tree.command(name="slowmode", description="Set slowmode on the current channel (Staff only)")
+@app_commands.describe(seconds="Slowmode delay in seconds (0 to disable, max 21600)")
+async def slowmode_cmd(interaction: discord.Interaction, seconds: int):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    if not 0 <= seconds <= 21600:
+        await interaction.response.send_message("❌ Slowmode must be between 0 and 21600 seconds.", ephemeral=True)
+        return
+    try:
+        await interaction.channel.edit(slowmode_delay=seconds)
+        if seconds == 0:
+            msg = f"✅ Slowmode **disabled** in {interaction.channel.mention}."
+        else:
+            msg = f"🐢 Slowmode set to **{seconds}s** in {interaction.channel.mention}."
+        await interaction.response.send_message(msg)
+    except discord.Forbidden:
+        await interaction.response.send_message("❌ Missing permissions.", ephemeral=True)
+
+
+@tree.command(name="dm", description="Send a DM to a user from the bot (Staff only)")
+@app_commands.describe(player="The player to DM", message="The message to send")
+async def dm_cmd(interaction: discord.Interaction, player: discord.Member, message: str):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+    if player.bot:
+        await interaction.response.send_message("❌ Cannot DM bots.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(
+        title=f"📨 Message from {interaction.guild.name} Staff",
+        description=message,
+        color=COLORS["blue"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_footer(text="TestYourTier | TYT — Reply in your support ticket")
+    try:
+        await player.send(embed=embed)
+        await interaction.followup.send(f"✅ DM sent to {player.mention}.", ephemeral=True)
+        await log_event("DM_SENT", player.id, details=f"By:{interaction.user.id} Msg:{message[:80]}")
+    except discord.Forbidden:
+        await interaction.followup.send("❌ Player has DMs closed.", ephemeral=True)
+
+
+@tree.command(name="stafflist", description="Show all staff members and their roles")
+async def stafflist_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    guild = interaction.guild
+
+    # Collect staff by role priority order
+    priority = [
+        "Ownership", "Founder", "Manager", "Staff Manager", "Media Manager",
+        "Admin", "TYT Admin", "Sr.Mod", "Moderator", "Helper", "Trial Staff", "TYT Staff",
+    ]
+    seen = set()
+    sections = []
+
+    for role_name in priority:
+        role = discord.utils.get(guild.roles, name=role_name)
+        if not role or not role.members:
+            continue
+        members_in_role = [m for m in role.members if not m.bot and m.id not in seen]
+        if not members_in_role:
+            continue
+        for m in members_in_role:
+            seen.add(m.id)
+        sections.append((role_name, members_in_role))
+
+    embed = discord.Embed(
+        title=f"👥 TYT Staff List — {guild.name}",
+        color=COLORS["gold"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+
+    if not sections:
+        embed.description = "No staff members found. Ensure staff roles match the known role names."
+    else:
+        for role_name, members in sections:
+            embed.add_field(
+                name=f"**{role_name}** ({len(members)})",
+                value=" ".join(m.mention for m in members) or "—",
+                inline=False
+            )
+
+    embed.set_footer(text=f"Total staff: {len(seen)} • TestYourTier | TYT")
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name="userinfo", description="View detailed info about a user")
+@app_commands.describe(player="The player to look up (defaults to yourself)")
+async def userinfo_cmd(interaction: discord.Interaction, player: discord.Member = None):
+    target = player or interaction.user
+    await interaction.response.defer(ephemeral=True)
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT minecraft_username, region, account_type FROM users WHERE user_id = ?", (target.id,)) as cur:
+            reg = await cur.fetchone()
+        async with db.execute(
+            "SELECT gamemode, current_tier FROM player_ranks WHERE user_id = ? AND current_tier != 'Unranked'",
+            (target.id,)
+        ) as cur:
+            ranks = await cur.fetchall()
+        async with db.execute(
+            "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND guild_id = ?",
+            (target.id, interaction.guild.id)
+        ) as cur:
+            warn_count = (await cur.fetchone())[0]
+
+    embed = discord.Embed(
+        title=f"👤 {target.display_name}",
+        color=target.color if target.color.value else COLORS["blue"]
+    )
+    embed.set_thumbnail(url=target.display_avatar.url)
+    embed.add_field(name="🏷️ Username", value=str(target), inline=True)
+    embed.add_field(name="🆔 ID", value=str(target.id), inline=True)
+    embed.add_field(name="📅 Joined Server", value=target.joined_at.strftime("%Y-%m-%d") if target.joined_at else "Unknown", inline=True)
+    embed.add_field(name="📅 Account Created", value=target.created_at.strftime("%Y-%m-%d"), inline=True)
+    embed.add_field(name="⚠️ Warnings", value=str(warn_count), inline=True)
+    embed.add_field(name="🎭 Roles", value=str(len(target.roles) - 1), inline=True)
+
+    if reg:
+        mc, region, acc_type = reg
+        embed.add_field(name="⛏️ MC Username", value=mc, inline=True)
+        embed.add_field(name="🌐 Region", value=region, inline=True)
+        embed.add_field(name="💎 Account", value=acc_type, inline=True)
+        embed.set_image(url=skin_url(mc))
+
+    if ranks:
+        embed.add_field(
+            name="🏆 Tiers",
+            value="\n".join(f"{GAMEMODE_EMOJIS.get(gm,'⚔️')} **{gm}:** {tier}" for gm, tier in ranks),
+            inline=False
+        )
+
+    embed.set_footer(text="TestYourTier | TYT")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@tree.command(name="resetcooldown", description="Reset a player's test cooldown (Staff only)")
+@app_commands.describe(player="The player", gamemode="Gamemode to reset (leave blank for all)")
+@app_commands.choices(gamemode=[app_commands.Choice(name=gm, value=gm) for gm in GAMEMODES])
+async def resetcooldown_cmd(interaction: discord.Interaction, player: discord.Member, gamemode: str = None):
+    cfg = await get_guild_config(interaction.guild.id)
+    if not has_staff_role(interaction.user, cfg.get("staff_role")):
+        await interaction.response.send_message("❌ Staff only.", ephemeral=True)
+        return
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        if gamemode:
+            await db.execute(
+                "DELETE FROM cooldowns WHERE user_id = ? AND gamemode = ?", (player.id, gamemode)
+            )
+            detail = f"Gamemode: {gamemode}"
+        else:
+            await db.execute("DELETE FROM cooldowns WHERE user_id = ?", (player.id,))
+            detail = "All gamemodes"
+        await db.commit()
+
+    await interaction.response.send_message(
+        f"✅ Cooldown reset for {player.mention} ({detail}).", ephemeral=True
+    )
+    await log_event("COOLDOWN_RESET", player.id, gamemode, details=f"By:{interaction.user.id}")
+
+
+@tree.command(name="botinfo", description="Show bot info and command count")
+async def botinfo_cmd(interaction: discord.Interaction):
+    cmds = len(tree.get_commands())
+    embed = discord.Embed(
+        title="🤖 TYT Bot Info",
+        color=COLORS["blue"],
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.set_thumbnail(url=bot.user.display_avatar.url)
+    embed.add_field(name="Bot Name", value=str(bot.user), inline=True)
+    embed.add_field(name="Bot ID", value=str(bot.user.id), inline=True)
+    embed.add_field(name="Servers", value=str(len(bot.guilds)), inline=True)
+    embed.add_field(name="Slash Commands", value=str(cmds), inline=True)
+    embed.add_field(name="Gamemodes", value=str(len(GAMEMODES)), inline=True)
+    embed.add_field(name="Tiers", value=str(len(TIERS)), inline=True)
+    embed.add_field(name="Stack", value="discord.py 2.x • aiosqlite • Flask", inline=False)
+    embed.add_field(name="Uptime Endpoint", value="`GET /` → TYT Bot Online", inline=False)
+    embed.set_footer(text="TestYourTier | TYT")
+    await interaction.response.send_message(embed=embed)
 
 
 # ─────────────────────────────────────────────
